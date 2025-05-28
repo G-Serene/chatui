@@ -1,2 +1,1 @@
-# chatui
-chatbot with browsing capability
+# AI Agents = reference
