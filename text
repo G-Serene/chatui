@@ -1,4 +1,20 @@
-◦
-AI Agents are autonomous software programs designed to perform specific tasks. They are modular systems for task-specific automation, often driven by LLMs and LIMs. Their operational scope is enabled by integrating LLMs and LIMs as core reasoning modules.
-◦
-Agentic AI systems are a paradigm shift representing systems of multiple AI agents collaborating to achieve complex goals. They manage multi-step, complex tasks and systems. They represent a conceptual leap from isolated systems to orchestrated multi-agent architectures.
+ azure_openai_ef = embedding_functions.OpenAIEmbeddingFunction(
+        api_key=AZURE_OPENAI_API_KEY,
+        api_base=AZURE_OPENAI_API_BASE,
+        api_type="azure",
+        model_name=AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME, # This is your DEPLOYMENT NAME for the embedding model
+        # api_version="2023-05-15" # Optional: specify API version if needed
+    )
+# ---- END NEW ----
+
+# Initialize ChromaDB with persistent storage
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+
+# Create collection WITH the specified embedding function
+collection = chroma_client.get_or_create_collection( # Use get_or_create_collection for idempotency
+    name="travel_documents",
+    metadata={"description": "travel_service"},
+    embedding_function=azure_openai_ef if azure_openai_ef else chromadb. Předvolby.DEFAULT_EMBEDDING_FUNCTION # Pass the function here
+    # If azure_openai_ef is None (due to missing env vars), it will use Chroma's default.
+    # Alternatively, you could raise an error if azure_openai_ef is None and you strictly require Azure embeddings.
+)
