@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ./data-discovery-chat-ui
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80" # Expose Nginx on host port 8080, container port 80
+    networks:
+      - app-network
+    # depends_on:
+    #   - backend # Optional: frontend will start after backend, but doesn't mean backend is ready
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001" # Expose backend on host port 3001, container port 3001
+    environment:
+      - PORT=3001
+      # Add any other backend environment variables here
+      # e.g., DATABASE_URL=...
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
