@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "es2020", // More modern target
+    "module": "commonjs", // Standard for Node.js
+    "lib": ["es2020"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "resolveJsonModule": true,
+    "sourceMap": true, // Good for development
+    "moduleResolution": "node" // Classic Node resolution
+  },
+  "include": ["src/**/*"], // Only compile files in src
+  "exclude": ["node_modules", "**/*.spec.ts", "**/*.test.ts"]
+}

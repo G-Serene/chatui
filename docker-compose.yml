@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ./data-discovery-chat-ui
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80" # Expose Nginx on host port 8080, container port 80
+    networks:
+      - app-network
+    # depends_on:
+    #   - backend # Optional: frontend will start after backend, but doesn't mean backend is ready
+
+  backend: # This service now points to the Python backend
+    build:
+      context: ./backend-python # Changed from ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "3001:8000"         # Host port 3001 maps to container port 8000 (Uvicorn's port)
+    environment:
+      - PORT=8000           # Environment variable for the port inside the Python container
+      # Add any other Python backend environment variables here
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
