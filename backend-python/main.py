@@ -1,228 +1,177 @@
 from fastapi import FastAPI
-# Removed duplicate FastAPI import
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import uvicorn
 import os
-from typing import List, Any, Optional, Union, Literal
+from typing import List, Any, Optional, Union, Literal, Dict
 import socketio
-import uuid # Added import for uuid
+import uuid # Ensure uuid is imported
+import yaml
+import aiofiles
+import asyncio
+from contextlib import asynccontextmanager
+
+from autogen_core import AgentId, SingleThreadedAgentRuntime, UserMessage, LLMMessage
+from autogen_core.models import ChatCompletionClient
+from .autogen_agent import MyDataDiscoveryAgent, STREAM_DONE
 
 # Load environment variables from .env file, if present
 load_dotenv()
 
-app = FastAPI(title="Data Discovery Chat Backend (Python)")
+# --- Global Variables (condensed) ---
+runtime: SingleThreadedAgentRuntime | None = None
+model_client_global: Optional[ChatCompletionClient] = None
+data_discovery_agent_global: MyDataDiscoveryAgent | None = None
 
+# --- Lifespan Management (condensed for plan, using verified logic) ---
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    global runtime, model_client_global, data_discovery_agent_global
+    print("FastAPI app starting up...")
+    model_config_path = "model_config.yaml"
+    try:
+        async with aiofiles.open(model_config_path, "r") as file: model_config_content = await file.read()
+        if not model_config_content.strip(): print(f"Warning: {model_config_path} is empty.")
+        else:
+            model_config = yaml.safe_load(model_config_content)
+            if model_config and model_config.get('provider'):
+                if model_config.get('config', {}).get('api_key') == 'REPLACE_WITH_YOUR_API_KEY': print(f"Warning: API key placeholder in {model_config_path}.")
+                else: model_client_global = ChatCompletionClient.load_component(model_config); print(f"Loaded model client from {model_config_path}")
+            else: print(f"Warning: Could not load model client config from {model_config_path}.")
+    except FileNotFoundError: print(f"Warning: {model_config_path} not found. LLM disabled.")
+    except Exception as e: print(f"Error loading model config: {e}")
+    runtime = SingleThreadedAgentRuntime()
+    if model_client_global:
+        data_discovery_agent_global = MyDataDiscoveryAgent(name="DataDiscoveryAssistant", model_client=model_client_global)
+        await MyDataDiscoveryAgent.register(runtime, "data_agent", lambda: data_discovery_agent_global)
+        print("MyDataDiscoveryAgent instance created and registered.")
+    else: print("Skipping agent registration.")
+    runtime.start(); print("AutoGen runtime started.")
+    yield
+    print("FastAPI app shutting down...")
+    if runtime: await runtime.stop(); print("AutoGen runtime stopped.")
 
-# --- CORS Configuration for FastAPI HTTP requests ---
-http_origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:8080",    # Dockerized frontend port used in docker-compose
-    "http://127.0.0.1:8080",
-]
+# Initialize FastAPI app with lifespan manager
+app = FastAPI(title="Data Discovery Chat Backend (Python)", lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=http_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Socket.IO Server Setup ---
-sio_cors_allowed_origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:8080",
-    "http://127.0.0.1:8080",
-]
-
-sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins=sio_cors_allowed_origins)
-# Wrap FastAPI app with Socket.IO's ASGI application
+# --- CORS & Socket.IO (condensed) ---
+http_origins = ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8080", "http://127.0.0.1:8080"]
+app.add_middleware(CORSMiddleware, allow_origins=http_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins=http_origins)
 socket_app = socketio.ASGIApp(sio, other_asgi_app=app)
 
+# --- Helper function for streaming agent responses (UPDATED) ---
+async def stream_responses_to_client(sid: str, queue: asyncio.Queue):
+    print(f"Starting to stream responses to client {sid}")
+    accumulated_chat_response = ""
+    current_chat_message_id: Optional[str] = None # Initialize to None
+    first_chat_chunk = True
 
-# --- Socket.IO Event Handlers ---
+    while True:
+        item = await queue.get()
+
+        if item is STREAM_DONE:
+            print(f"Stream finished for client {sid}. Full chat response: {accumulated_chat_response}")
+            if current_chat_message_id is not None: # Only send end if a chat stream started
+                sender_type = "ai_error" if accumulated_chat_response.startswith("ERROR:") else "ai"
+                await sio.emit('ai_message_end', {
+                    "id": current_chat_message_id,
+                    "sender": sender_type,
+                    "full_response": accumulated_chat_response
+                }, room=sid)
+            break
+
+        if not isinstance(item, dict) or "stream_type" not in item:
+            print(f"Warning: Received unexpected item from queue for {sid}: {item}")
+            queue.task_done()
+            continue
+
+        stream_type = item.get("stream_type")
+        event_data = item.get("data")
+        artifact_id = item.get("artifact_id")
+
+        if stream_type == "artifact_start":
+            metadata = item.get("metadata", {})
+            artifact_type_from_event = item.get("artifact_type", "unknown") # Renamed to avoid conflict
+            await sio.emit('artifact_stream_start', {
+                "artifact_id": artifact_id,
+                "artifact_type": artifact_type_from_event,
+                "metadata": metadata
+            }, room=sid)
+            print(f"Sent 'artifact_stream_start' to {sid} for artifact {artifact_id}")
+        elif stream_type == "artifact_chunk":
+            await sio.emit('artifact_stream_chunk', {
+                "artifact_id": artifact_id,
+                "chunk_data": event_data
+            }, room=sid)
+        elif stream_type == "artifact_end":
+            await sio.emit('artifact_stream_end', {"artifact_id": artifact_id}, room=sid)
+            print(f"Sent 'artifact_stream_end' to {sid} for artifact {artifact_id}")
+        elif stream_type == "chat_chunk":
+            if first_chat_chunk:
+                current_chat_message_id = str(uuid.uuid4())
+            text_chunk = str(event_data)
+            accumulated_chat_response += text_chunk
+            await sio.emit('ai_message_chunk', {
+                "id": current_chat_message_id,
+                "text": text_chunk,
+                "sender": "ai",
+                "is_first_chunk": first_chat_chunk
+            }, room=sid)
+            first_chat_chunk = False
+        elif stream_type == "error":
+            if first_chat_chunk:
+                current_chat_message_id = str(uuid.uuid4())
+            error_text = str(event_data)
+            accumulated_chat_response += error_text # Include error in final accumulated chat for logging
+            await sio.emit('ai_message_chunk', {
+                "id": current_chat_message_id,
+                "text": error_text,
+                "sender": "ai_error",
+                "is_first_chunk": first_chat_chunk
+            }, room=sid)
+            first_chat_chunk = False
+            print(f"Sent error chunk as 'ai_message_chunk' to {sid}: {error_text}")
+        else:
+            print(f"Warning: Unknown stream_type '{stream_type}' from queue for {sid}")
+
+        queue.task_done()
+
+# --- Socket.IO Event Handlers (condensed) ---
 @sio.event
-async def connect(sid, environ):
-    print(f"Socket.IO Client connected: {sid}")
-    # You can also access environ for request details, e.g., headers
-    # print(f"Connection environment: {environ}")
-
+async def connect(sid, environ): print(f"Socket.IO Client connected: {sid}")
 @sio.event
-async def disconnect(sid):
-    print(f"Socket.IO Client disconnected: {sid}")
+async def disconnect(sid): print(f"Socket.IO Client disconnected: {sid}")
+@sio.on('send_chat_message')
+async def handle_socket_chat_message(sid, data):
+    user_message_text = data.get("message")
+    global data_discovery_agent_global, runtime, model_client_global
+    if not user_message_text: await sio.emit('ai_message_end', {"id": str(uuid.uuid4()), "sender": "ai_error", "full_response": "Error: No message text provided."}, room=sid); return
+    if not runtime or not model_client_global or not data_discovery_agent_global: await sio.emit('ai_message_end', {"id": str(uuid.uuid4()), "sender": "ai_error", "full_response": "AI service not configured."}, room=sid); return
+    response_queue = asyncio.Queue()
+    user_llm_message = UserMessage(content=user_message_text)
+    try:
+        asyncio.create_task(data_discovery_agent_global.handle_chat_message(user_llm_message, response_queue))
+        asyncio.create_task(stream_responses_to_client(sid, response_queue))
+    except Exception as e: await sio.emit('ai_message_end', {"id": str(uuid.uuid4()), "sender": "ai_error", "full_response": str(e)}, room=sid)
 
-# Optional: A generic message handler for basic testing
-# @sio.event
-# async def message(sid, data):
-#     print(f"Socket.IO message from {sid}: {data}")
-#     await sio.emit('reply', f"Server received: {data}", room=sid)
-
-
-# --- Pydantic Models for /api/chat ---
-class ChatMessageRequest(BaseModel):
-    message: str
-
-class ChatApiResponse(BaseModel):
-    success: bool
-    message: str
-    # Potentially add a session ID or user ID if needed for targeted WebSocket emits
-    # sid: Optional[str] = None 
-
-# --- Pydantic Models for /api/generate-artifact ---
-class ArtifactRequest(BaseModel):
-    query: str
-
-# Specific content models
-class DataArtifactContentData(BaseModel):
-    columns: List[str]
-    rows: List[List[Any]]
-
-# Response models for each artifact type
-class CodeArtifactResponse(BaseModel):
-    type: Literal["code"]
-    language: str
-    content: str
-
-class DataArtifactResponse(BaseModel):
-    type: Literal["data"]
-    format: str
-    title: Optional[str] = None
-    content: DataArtifactContentData
-
-class MessageArtifactResponse(BaseModel):
-    type: Literal["message"]
-    content: str
-
-# Union of possible artifact responses
+# --- Pydantic Models & Other Endpoints (condensed) ---
+class ChatMessageRequest(BaseModel): message: str
+class ChatApiResponse(BaseModel): success: bool; message: str
+class ArtifactRequest(BaseModel): query: str
+class DataArtifactContentData(BaseModel): columns: List[str]; rows: List[List[Any]]
+class CodeArtifactResponse(BaseModel): type: Literal["code"]; language: str; content: str
+class DataArtifactResponse(BaseModel): type: Literal["data"]; format: str; title: Optional[str] = None; content: DataArtifactContentData
+class MessageArtifactResponse(BaseModel): type: Literal["message"]; content: str
 ArtifactResponseUnion = Union[CodeArtifactResponse, DataArtifactResponse, MessageArtifactResponse]
-
-# --- Mock Artifact Data ---
-mock_artifacts_data = [
-    {
-        "id": "sales-data-table",
-        "description": "A mock JSON data table for sales figures.",
-        "keywords": ["sales", "revenue", "table", "data", "report"],
-        "artifact": {
-            "type": "data",
-            "format": "json",
-            "title": "Quarterly Sales Report",
-            "content": {
-                "columns": ["Quarter", "Product Category", "Total Sales", "Units Sold"],
-                "rows": [
-                    ["Q1 2024", "Electronics", 150000, 350],
-                    ["Q1 2024", "Appliances", 120000, 200],
-                    ["Q2 2024", "Electronics", 175000, 400],
-                    ["Q2 2024", "Appliances", 110000, 180],
-                ]
-            }
-        }
-    },
-    {
-        "id": "product-inventory-table",
-        "description": "A mock JSON data table for product inventory.",
-        "keywords": ["product", "inventory", "stock", "table", "data"],
-        "artifact": {
-            "type": "data",
-            "format": "json",
-            "title": "Product Inventory Levels",
-            "content": {
-                "columns": ["Product ID", "Name", "Category", "Stock Level", "Reorder Point"],
-                "rows": [
-                    ["PID001", "Laptop Pro X", "Electronics", 75, 50],
-                    ["PID002", "Smart Thermostat", "Home Automation", 120, 100],
-                    ["PID003", "Wireless Mouse", "Accessories", 300, 150],
-                    ["PID004", "Coffee Maker Deluxe", "Appliances", 45, 50],
-                ]
-            }
-        }
-    },
-    {
-        "id": "python-user-processing-script",
-        "description": "A mock Python code snippet for user processing.",
-        "keywords": ["python", "user", "script", "code", "processing", "analysis"],
-        "artifact": {
-            "type": "code",
-            "language": "python",
-            "content": "# Mock Python script for user data processing\n\ndef process_users(user_list):\n  active_users = []\n  for user in user_list:\n    if user.get('is_active'):\n      print(f\"Processing active user: {user.get('name')}\")\n      active_users.append(user)\n  return active_users\n\n# Example usage:\n# users = [{'name': 'Alice', 'is_active': True}, {'name': 'Bob', 'is_active': False}]\n# process_users(users)"
-        }
-    },
-    {
-        "id": "sql-active-customers-query",
-        "description": "A mock SQL query for fetching active customers.",
-        "keywords": ["sql", "active", "customer", "query", "database"],
-        "artifact": {
-            "type": "code",
-            "language": "sql",
-            "content": "SELECT\n  customer_id,\n  first_name,\n  last_name,\n  email,\n  last_login_date\nFROM\n  customers\nWHERE\n  is_active = TRUE\n  AND last_login_date >= CURRENT_DATE - INTERVAL '30 days'\nORDER BY\n  last_login_date DESC;"
-        }
-    },
-    {
-        "id": "javascript-ui-validation-script",
-        "description": "A mock JavaScript code snippet for UI form validation.",
-        "keywords": ["javascript", "js", "ui", "form", "validation", "script", "code"],
-        "artifact": {
-            "type": "code",
-            "language": "javascript",
-            "content": "// Mock JavaScript for UI form validation\n\nfunction validateEmail(email) {\n  if (!email) return false;\n  const emailRegex = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\n  return emailRegex.test(email);\n}\n\nfunction validatePassword(password) {\n  if (!password || password.length < 8) return false;\n  // Add more complex rules if needed\n  return true;\n}\n\n// Example usage:\n// const emailInput = document.getElementById('email');\n// const isValid = validateEmail(emailInput.value);\n// console.log('Email is valid:', isValid);"
-        }
-    }
-]
-
-# --- API Endpoints ---
 @app.get("/")
-async def read_root():
-    return {"message": "Python backend is running!"}
-
-@app.post("/api/chat", response_model=ChatApiResponse)
-async def handle_chat_message(chat_request: ChatMessageRequest):
-    print(f"Received chat message: {chat_request.message}")
-    
-    user_message_lower = chat_request.message.lower()
-    artifact_keywords = ["find", "search", "generate", "show me", "what is", "create", "display"]
-    
-    ai_reply_text: str
-    if any(keyword in user_message_lower for keyword in artifact_keywords):
-        ai_reply_text = "I've processed your request. If it's something I can generate an artifact for, you might see it in the artifact window, or you can try a more specific command like 'generate sales data table'."
-    else:
-        ai_reply_text = f"AI says: You sent '{chat_request.message}'. This is a mock Python AI response."
-        
-    ai_message_id = str(uuid.uuid4())
-    ai_response_data = {
-        "id": ai_message_id,
-        "text": ai_reply_text,
-        "sender": "ai"
-    }
-    
-    # Simulate some processing time before emitting, if desired
-    # import asyncio
-    # await asyncio.sleep(0.5) 
-    
-    await sio.emit('ai_message', ai_response_data)
-    print(f"Emitted AI message: {ai_response_data}")
-    
-    return ChatApiResponse(success=True, message="Message received and is being processed")
-
-@app.post("/api/generate-artifact", response_model=ArtifactResponseUnion)
-async def generate_artifact(request_data: ArtifactRequest):
-    query = request_data.query.lower()
-    print(f"Received artifact generation query: \"{request_data.query}\"")
-
-    for item in mock_artifacts_data:
-        if any(keyword.lower() in query for keyword in item["keywords"]):
-            print(f"Matched artifact: \"{item['description']}\" based on query keywords.")
-            return item["artifact"]
-
-    print("No specific artifact matched. Returning default message.")
-    return MessageArtifactResponse(
-        type="message",
-        content="No specific artifact could be generated for your query. Please try phrases like 'generate sales table' or 'show python script for users'."
-    )
+async def read_root(): return {"message": "Python backend is running!"}
+@app.post("/api/chat", response_model=ChatApiResponse, deprecated=True)
+async def http_handle_chat_message(chat_request: ChatMessageRequest): return ChatApiResponse(success=False, message="This HTTP chat endpoint is deprecated. Please use WebSocket.")
+@app.post("/api/generate-artifact", response_model=MessageArtifactResponse)
+async def handle_generate_artifact(request_data: ArtifactRequest): return MessageArtifactResponse(type="message", content="Artifact generation via this direct endpoint is under review for AutoGen integration...")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    # Use "main:socket_app" to run the combined FastAPI and Socket.IO app
     uvicorn.run("main:socket_app", host="0.0.0.0", port=port, reload=True)
